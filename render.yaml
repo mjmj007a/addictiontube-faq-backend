@@ -1,12 +1,21 @@
+# =======================================================
+# AddictionTube FAQ Backend – Render Deployment (Phase 3)
+# =======================================================
+
 services:
   - type: web
     name: addictiontube-faq-backend
     env: python
     plan: starter
+    region: oregon
+    branch: main
     autoDeploy: true
+
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn -w 2 -k gthread -t 120 -b 0.0.0.0:$PORT app:app
+
     envVars:
+      # --- MySQL Database (AddictionTube FAQs) ---
       - key: MYSQL_HOST
         sync: false
       - key: MYSQL_DB
@@ -15,15 +24,35 @@ services:
         sync: false
       - key: MYSQL_PASS
         sync: false
-      - key: WEAVIATE_CLUSTER_URL
-        sync: false
+
+      # --- Vector Database (Weaviate Cloud) ---
+      - key: WEAVIATE_URL
+        value: https://cal45wxptmejehuww6b9a.c0.us-west3.gcp.weaviate.cloud
       - key: WEAVIATE_API_KEY
         sync: false
+
+      # --- OpenAI Embedding Model ---
       - key: OPENAI_API_KEY
         sync: false
       - key: EMBED_MODEL
         value: text-embedding-3-small
       - key: BATCH_SIZE
         value: "128"
+
+      # --- Flask & CORS Settings ---
+      - key: FLASK_ENV
+        value: production
       - key: CORS_ORIGINS
         value: "https://addictiontube.com,http://addictiontube.com"
+
+      # --- Optional Identifiers ---
+      - key: SERVICE_NAME
+        value: addictiontube-faq-backend
+
+# =======================================================
+# Notes:
+#  - `sync: false` means you’ll set secrets manually in Render’s dashboard.
+#  - MySQL vars connect to your AddictionTube FAQ DB.
+#  - Weaviate handles vector search + embeddings.
+#  - Gunicorn settings tuned for concurrency & long-running requests.
+# =======================================================
