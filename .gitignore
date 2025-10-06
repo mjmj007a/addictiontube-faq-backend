@@ -1,0 +1,55 @@
+# Python-specific
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Environment variables
+.env
+.env.local
+.env.development
+.env.production
+
+# Configuration files
+.config_v
+config.ini
+*.config
+config_v.py
+config_.py
+
+# Logs
+*.log
+unified_search.log
+php_errors.log
+faq_search.log
+
+# IDE and editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Dependency directories
+node_modules/
+vendor/
+
+# Render-specific
+*.pid
+*.seed
+*.rdb
+
+# Miscellaneous
+*.bak
+*.swp
+*~

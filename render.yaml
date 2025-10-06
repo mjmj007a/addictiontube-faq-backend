@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: addictiontube-faq-backend
+    env: python
+    plan: starter
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 2 -k gthread -t 120 -b 0.0.0.0:$PORT app:app
+    envVars:
+      - key: MYSQL_HOST
+        sync: false
+      - key: MYSQL_DB
+        sync: false
+      - key: MYSQL_USER
+        sync: false
+      - key: MYSQL_PASS
+        sync: false
+      - key: WEAVIATE_CLUSTER_URL
+        sync: false
+      - key: WEAVIATE_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: EMBED_MODEL
+        value: text-embedding-3-small
+      - key: BATCH_SIZE
+        value: "128"
+      - key: CORS_ORIGINS
+        value: "https://addictiontube.com,http://addictiontube.com"
