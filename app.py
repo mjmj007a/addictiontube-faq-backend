@@ -19,7 +19,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEAVIATE_CLUSTER_URL = os.getenv("WEAVIATE_CLUSTER_URL")
 WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-CORS_ORIGINS = [o.strip() for o in (os.getenv("CORS_ORIGINS","https://addictiontube.com").split(","))]
+CORS_ORIGINS = [o.strip() for o in (os.getenv("CORS_ORIGINS","https://addictiontube.com,http://addictiontube.com").split(","))]
 
 missing = [k for k,v in dict(
     OPENAI_API_KEY=OPENAI_API_KEY,
@@ -69,6 +69,10 @@ def get_embedding(text: str):
 
 def strip_query(q: str) -> str:
     return re.sub(r'[\r\n\t]+',' ', (q or "")).strip()
+
+def normalize_dashes(text: str) -> str:
+    # Replace em dash (—) and en dash (–) with ", "
+    return (text or "").replace("—", ", ").replace("–", ", ")
 
 # --- Routes ---
 @app.route("/", methods=["GET","HEAD"])
@@ -136,6 +140,8 @@ def search_faq():
                 "created_at": p.get("created_at"),
                 "updated_at": p.get("updated_at")
             })
+
+        logger.info("QUERY %s", {"q": query, "category": category, "subcategory": subcategory, "tags": tags, "n": len(out)})
         return jsonify({"results": out})
     finally:
         wc.close()
@@ -215,6 +221,8 @@ def rag_faq():
                 temperature=0.3
             )
             answer = (resp.choices[0].message.content or "").strip()
+            # Normalize em/en dashes to ", " for clean display
+            answer = normalize_dashes(answer)
 
             # If model forgot citations, append a Sources line so users still see provenance
             if "[FAQ:" not in answer and sources:
@@ -222,7 +230,7 @@ def rag_faq():
                 answer = f"{answer}\n\n{src_line}"
 
             return jsonify({"answer": answer, "sources": sources[:top_k]})
-        except Exception as e:
+        except APIError as e:
             logger.exception(f"OpenAI call failed: {e}")
             return jsonify({"error":"openai_unavailable","details":str(e)}), 502
 
@@ -267,6 +275,24 @@ def stats_faq():
         return jsonify({"error":"stats_failed","details":str(e)}), 500
     finally:
         wc.close()
+
+# -----------------------------------------
+# FEEDBACK ROUTE (thumbs up/down; Phase 4 hook)
+# -----------------------------------------
+@app.route("/feedback", methods=["POST"])
+@limiter.limit("200/day")
+def feedback():
+    data = request.get_json(force=True) or {}
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "query": strip_query(data.get("query","")),
+        "faq_ids": data.get("faq_ids") or [],
+        "useful": bool(data.get("useful", True)),
+        "notes": strip_query(data.get("notes","")),
+        "score_hint": data.get("score_hint"),
+    }
+    logger.info(f"FEEDBACK {payload}")
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8002"))
