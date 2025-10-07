@@ -10,7 +10,7 @@ import os, re, logging, random, tiktoken
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-
+from traceback import format_exc
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -155,35 +155,41 @@ def rag_faq():
         if reroll:
             random.shuffle(matches)
 
-        # Build a bounded context and collect source ids/scores
-        enc = tiktoken.get_encoding("cl100k_base")
-        max_tokens = 12000
-        ctx_parts, used = [], 0
+        # Build context with a robust char budget (no tiktoken needed)
+        CHAR_BUDGET = 24000  # roughly ~12k tokens equivalent margin
+        used = 0
+        ctx_parts = []
         sources = []
+
         for o in matches:
-            p = o.properties or {}
-            m = o.metadata or {}
-            fid = p.get("faq_id")
-            qtxt = p.get("question","")
-            atxt = p.get("answer","")
+            p = (o.properties or {})
+            m = (o.metadata or {})
+            fid = str(p.get("faq_id") or "").strip()
+            qtxt = (p.get("question") or "").strip()
+            atxt = (p.get("answer") or "").strip()
             piece = f"FAQ:{fid}\nQ: {qtxt}\nA: {atxt}\n"
-            t = len(enc.encode(piece))
-            if used + t > max_tokens:
+            if used + len(piece) > CHAR_BUDGET:
                 break
-            ctx_parts.append(piece); used += t
+            ctx_parts.append(piece)
+            used += len(piece)
             if fid:
-                sources.append({"faq_id": fid, "distance": m.get("distance"), "score": (1 - m.get("distance")) if m.get("distance") is not None else None})
+                dist = m.get("distance")
+                sources.append({
+                    "faq_id": fid,
+                    "distance": dist,
+                    "score": (1 - dist) if isinstance(dist, (int, float)) else None
+                })
             if len(sources) >= top_k:
                 break
-        context = "\n---\n".join(ctx_parts)
 
-        # Build a strict instruction to cite only provided IDs
-        allowed_ids = ", ".join(str(s["faq_id"]) for s in sources if s.get("faq_id"))
+        context = "\n---\n".join(ctx_parts)
+        allowed_ids = ", ".join(s["faq_id"] for s in sources if s.get("faq_id"))
+
         system = (
             "You are an empathetic addiction-recovery FAQ assistant. "
             "Answer clearly, briefly, and supportively using ONLY the provided FAQs. "
             f"When citing, ONLY use IDs from this set: [{allowed_ids}]. "
-            "Citations must appear inline like [FAQ:123], and you may include multiple such tags."
+            "Citations must appear inline like [FAQ:123]; you may include multiple."
         )
         user = (
             "Use ONLY the FAQs below as ground truth. Then answer the question.\n\n"
@@ -195,25 +201,28 @@ def rag_faq():
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o",
-                messages=[
-                    {"role":"system","content":system},
-                    {"role":"user","content":user}
-                ],
+                messages=[{"role":"system","content":system},{"role":"user","content":user}],
                 max_tokens=700,
                 temperature=0.3
             )
-            answer = resp.choices[0].message.content or ""
+            answer = (resp.choices[0].message.content or "").strip()
 
-            # If the model failed to include any citation, append a Sources line from retrieved IDs.
+            # If model forgot citations, append a Sources line so users still see provenance
             if "[FAQ:" not in answer and sources:
                 src_line = "Sources: " + ", ".join(f"[FAQ:{s['faq_id']}]" for s in sources[:top_k])
                 answer = f"{answer}\n\n{src_line}"
 
             return jsonify({"answer": answer, "sources": sources[:top_k]})
-        except APIError as e:
+        except Exception as e:
+            logger.exception(f"OpenAI call failed: {e}")
             return jsonify({"error":"openai_unavailable","details":str(e)}), 502
+
+    except Exception as e:
+        logger.exception(f"/rag_faq failed: {e}\n{format_exc()}")
+        return jsonify({"error":"internal_error","details":str(e)}), 500
     finally:
         wc.close()
+
 
 
 # -----------------------------------------
