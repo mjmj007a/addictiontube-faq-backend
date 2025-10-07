@@ -8,6 +8,7 @@ from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter
 import os, re, logging, random, tiktoken
 from logging.handlers import RotatingFileHandler
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,14 +16,13 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEAVIATE_CLUSTER_URL = os.getenv("WEAVIATE_CLUSTER_URL")
 WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CORS_ORIGINS = [o.strip() for o in (os.getenv("CORS_ORIGINS","https://addictiontube.com").split(","))]
 
-# Basic validation
 missing = [k for k,v in dict(OPENAI_API_KEY=OPENAI_API_KEY, WEAVIATE_CLUSTER_URL=WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY=WEAVIATE_API_KEY).items() if not v]
 if missing:
     raise EnvironmentError("Missing env vars: " + ", ".join(missing))
 
-# App + CORS + Limiter + Logging
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": CORS_ORIGINS}})
 
@@ -31,6 +31,9 @@ logger.setLevel(logging.INFO)
 handler = RotatingFileHandler('/tmp/faq_search.log', maxBytes=10_485_760, backupCount=3)
 handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
 logger.addHandler(handler)
+console = logging.StreamHandler()
+console.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+logger.addHandler(console)
 
 limiter = Limiter(get_remote_address, app=app, default_limits=["200 per day", "60 per hour"], storage_uri="memory://", headers_enabled=True)
 
@@ -53,7 +56,7 @@ def get_weaviate_client():
     raise EnvironmentError("Weaviate client initialization failed")
 
 def get_embedding(text):
-    resp = client.embeddings.create(input=text, model="text-embedding-3-small")
+    resp = client.embeddings.create(input=text, model=EMBED_MODEL)
     return resp.data[0].embedding
 
 def strip_query(q: str) -> str:
@@ -112,6 +115,7 @@ def search_faq():
             p, m = o.properties or {}, o.metadata or {}
             out.append({
                 "distance": m.get("distance"),
+                "score": 1 - m.get("distance") if m.get("distance") else None,
                 "faq_id": p.get("faq_id"),
                 "question": p.get("question"),
                 "answer": p.get("answer"),
@@ -148,35 +152,27 @@ def rag_faq():
         matches = res.objects or []
         if reroll:
             random.shuffle(matches)
-
         if not matches:
             return jsonify({"error":"no matches found"}), 404
 
-        # Build context window
         enc = tiktoken.get_encoding("cl100k_base")
         max_tokens = 12000
         ctx, used = [], 0
         for o in matches:
             p = o.properties or {}
-            chunk = f"Q: {p.get('question','')}
-A: {p.get('answer','')}"
+            chunk = f"Q: {p.get('question','')}\nA: {p.get('answer','')}"
             t = len(enc.encode(chunk))
             if used + t > max_tokens: break
             ctx.append(chunk); used += t
         context = "\n\n---\n\n".join(ctx)
 
         system = "You are an empathetic addiction-recovery FAQ assistant. Answer clearly and cite specific FAQ ids you used."
-        user = f"Use the following FAQs as your only ground truth. Then answer the question.
-
-{context}
-
-Question: {q}
-Answer:"
+        user = f"Use the following FAQs as your only ground truth. Then answer the question.\n\n{context}\n\nQuestion: {q}\nAnswer:"
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o",
                 messages=[{"role":"system","content":system},{"role":"user","content":user}],
-                max_tokens=700
+                max_tokens=1200
             )
             answer = resp.choices[0].message.content
             return jsonify({"answer": answer})
@@ -185,6 +181,39 @@ Answer:"
     finally:
         wc.close()
 
+# -----------------------------------------
+# NEW: FAQ STATS ROUTE
+# -----------------------------------------
+@app.route("/stats_faq", methods=["GET"])
+@limiter.limit("30/minute")
+def stats_faq():
+    wc = get_weaviate_client()
+    try:
+        col = wc.collections.get("FAQ")
+        result = col.aggregate.over_all(total_count=True, group_by="category")
+        total = result.total_count
+        groups = []
+        for g in result.groups or []:
+            groups.append({"category": g.value or "(Uncategorized)", "count": g.total_count})
+        q_latest = col.query.fetch_objects(limit=1, return_properties=["updated_at"], sort=[{"path": ["updated_at"], "order": "desc"}])
+        latest = None
+        if q_latest.objects:
+            latest = q_latest.objects[0].properties.get("updated_at")
+
+        data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "total_count": total,
+            "categories": groups,
+            "last_updated_at": latest
+        }
+        return jsonify(data)
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        return jsonify({"error":"stats_failed","details":str(e)}), 500
+    finally:
+        wc.close()
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8002"))
+    logger.info(f"AddictionTube FAQ backend started on port {port}")
     app.run(host="0.0.0.0", port=port)
