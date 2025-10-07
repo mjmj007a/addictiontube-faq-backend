@@ -150,36 +150,71 @@ def rag_faq():
             return_properties=["faq_id","question","answer","category","subcategory","tags"]
         )
         matches = res.objects or []
-        if reroll:
-            random.shuffle(matches)
         if not matches:
             return jsonify({"error":"no matches found"}), 404
+        if reroll:
+            random.shuffle(matches)
 
+        # Build a bounded context and collect source ids/scores
         enc = tiktoken.get_encoding("cl100k_base")
         max_tokens = 12000
-        ctx, used = [], 0
+        ctx_parts, used = [], 0
+        sources = []
         for o in matches:
             p = o.properties or {}
-            chunk = f"Q: {p.get('question','')}\nA: {p.get('answer','')}"
-            t = len(enc.encode(chunk))
-            if used + t > max_tokens: break
-            ctx.append(chunk); used += t
-        context = "\n\n---\n\n".join(ctx)
+            m = o.metadata or {}
+            fid = p.get("faq_id")
+            qtxt = p.get("question","")
+            atxt = p.get("answer","")
+            piece = f"FAQ:{fid}\nQ: {qtxt}\nA: {atxt}\n"
+            t = len(enc.encode(piece))
+            if used + t > max_tokens:
+                break
+            ctx_parts.append(piece); used += t
+            if fid:
+                sources.append({"faq_id": fid, "distance": m.get("distance"), "score": (1 - m.get("distance")) if m.get("distance") is not None else None})
+            if len(sources) >= top_k:
+                break
+        context = "\n---\n".join(ctx_parts)
 
-        system = "You are an empathetic addiction-recovery FAQ assistant. Answer clearly and cite specific FAQ ids you used."
-        user = f"Use the following FAQs as your only ground truth. Then answer the question.\n\n{context}\n\nQuestion: {q}\nAnswer:"
+        # Build a strict instruction to cite only provided IDs
+        allowed_ids = ", ".join(str(s["faq_id"]) for s in sources if s.get("faq_id"))
+        system = (
+            "You are an empathetic addiction-recovery FAQ assistant. "
+            "Answer clearly, briefly, and supportively using ONLY the provided FAQs. "
+            f"When citing, ONLY use IDs from this set: [{allowed_ids}]. "
+            "Citations must appear inline like [FAQ:123], and you may include multiple such tags."
+        )
+        user = (
+            "Use ONLY the FAQs below as ground truth. Then answer the question.\n\n"
+            f"{context}\n\n"
+            f"Question: {q}\n"
+            "Answer succinctly (120-200 words), with inline citations [FAQ:<id>] that are actually in the provided list."
+        )
+
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o",
-                messages=[{"role":"system","content":system},{"role":"user","content":user}],
-                max_tokens=1200
+                messages=[
+                    {"role":"system","content":system},
+                    {"role":"user","content":user}
+                ],
+                max_tokens=700,
+                temperature=0.3
             )
-            answer = resp.choices[0].message.content
-            return jsonify({"answer": answer})
+            answer = resp.choices[0].message.content or ""
+
+            # If the model failed to include any citation, append a Sources line from retrieved IDs.
+            if "[FAQ:" not in answer and sources:
+                src_line = "Sources: " + ", ".join(f"[FAQ:{s['faq_id']}]" for s in sources[:top_k])
+                answer = f"{answer}\n\n{src_line}"
+
+            return jsonify({"answer": answer, "sources": sources[:top_k]})
         except APIError as e:
             return jsonify({"error":"openai_unavailable","details":str(e)}), 502
     finally:
         wc.close()
+
 
 # -----------------------------------------
 # NEW: FAQ STATS ROUTE
