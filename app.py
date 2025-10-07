@@ -6,23 +6,30 @@ from openai import OpenAI, APIError
 import weaviate
 from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter
-import os, re, logging, random, tiktoken
+import os, re, logging, random
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from traceback import format_exc
+
 load_dotenv()
 
+# --- Env ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEAVIATE_CLUSTER_URL = os.getenv("WEAVIATE_CLUSTER_URL")
 WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CORS_ORIGINS = [o.strip() for o in (os.getenv("CORS_ORIGINS","https://addictiontube.com").split(","))]
 
-missing = [k for k,v in dict(OPENAI_API_KEY=OPENAI_API_KEY, WEAVIATE_CLUSTER_URL=WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY=WEAVIATE_API_KEY).items() if not v]
+missing = [k for k,v in dict(
+    OPENAI_API_KEY=OPENAI_API_KEY,
+    WEAVIATE_CLUSTER_URL=WEAVIATE_CLUSTER_URL,
+    WEAVIATE_API_KEY=WEAVIATE_API_KEY
+).items() if not v]
 if missing:
     raise EnvironmentError("Missing env vars: " + ", ".join(missing))
 
+# --- App / CORS / Logging / Rate limits ---
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": CORS_ORIGINS}})
 
@@ -39,6 +46,7 @@ limiter = Limiter(get_remote_address, app=app, default_limits=["200 per day", "6
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# --- Helpers ---
 def get_weaviate_client():
     for attempt in range(3):
         try:
@@ -55,13 +63,14 @@ def get_weaviate_client():
             logger.warning(f"Weaviate init attempt {attempt+1} failed: {e}")
     raise EnvironmentError("Weaviate client initialization failed")
 
-def get_embedding(text):
+def get_embedding(text: str):
     resp = client.embeddings.create(input=text, model=EMBED_MODEL)
     return resp.data[0].embedding
 
 def strip_query(q: str) -> str:
-    return re.sub(r'[\r\n\t]+',' ', q).strip()
+    return re.sub(r'[\r\n\t]+',' ', (q or "")).strip()
 
+# --- Routes ---
 @app.route("/", methods=["GET","HEAD"])
 def healthz():
     wc = get_weaviate_client()
@@ -111,11 +120,12 @@ def search_faq():
         )
 
         out = []
-        for o in res.objects:
-            p, m = o.properties or {}, o.metadata or {}
+        for o in (res.objects or []):
+            p = o.properties or {}
+            dist = getattr(o.metadata, "distance", None)
             out.append({
-                "distance": m.get("distance"),
-                "score": 1 - m.get("distance") if m.get("distance") else None,
+                "distance": dist,
+                "score": (1 - dist) if isinstance(dist, (int, float)) else None,
                 "faq_id": p.get("faq_id"),
                 "question": p.get("question"),
                 "answer": p.get("answer"),
@@ -156,14 +166,13 @@ def rag_faq():
             random.shuffle(matches)
 
         # Build context with a robust char budget (no tiktoken needed)
-        CHAR_BUDGET = 24000  # roughly ~12k tokens equivalent margin
+        CHAR_BUDGET = 24000
         used = 0
         ctx_parts = []
         sources = []
 
         for o in matches:
             p = (o.properties or {})
-            m = (o.metadata or {})
             fid = str(p.get("faq_id") or "").strip()
             qtxt = (p.get("question") or "").strip()
             atxt = (p.get("answer") or "").strip()
@@ -173,7 +182,7 @@ def rag_faq():
             ctx_parts.append(piece)
             used += len(piece)
             if fid:
-                dist = m.get("distance")
+                dist = getattr(o.metadata, "distance", None)
                 sources.append({
                     "faq_id": fid,
                     "distance": dist,
@@ -223,10 +232,8 @@ def rag_faq():
     finally:
         wc.close()
 
-
-
 # -----------------------------------------
-# NEW: FAQ STATS ROUTE
+# FAQ STATS ROUTE
 # -----------------------------------------
 @app.route("/stats_faq", methods=["GET"])
 @limiter.limit("30/minute")
@@ -237,9 +244,13 @@ def stats_faq():
         result = col.aggregate.over_all(total_count=True, group_by="category")
         total = result.total_count
         groups = []
-        for g in result.groups or []:
+        for g in (result.groups or []):
             groups.append({"category": g.value or "(Uncategorized)", "count": g.total_count})
-        q_latest = col.query.fetch_objects(limit=1, return_properties=["updated_at"], sort=[{"path": ["updated_at"], "order": "desc"}])
+        q_latest = col.query.fetch_objects(
+            limit=1,
+            return_properties=["updated_at"],
+            sort=[{"path": ["updated_at"], "order": "desc"}]
+        )
         latest = None
         if q_latest.objects:
             latest = q_latest.objects[0].properties.get("updated_at")
