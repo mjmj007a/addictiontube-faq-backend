@@ -298,3 +298,43 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT","8002"))
     logger.info(f"AddictionTube FAQ backend started on port {port}")
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/export_sample", methods=["GET"])
+@limiter.limit("30/minute")
+def export_sample():
+    q = strip_query(request.args.get("q", ""))
+    if not q:
+        return jsonify({"error": "missing q"}), 400
+
+    wc = get_weaviate_client()
+    try:
+        vector = get_embedding(q)
+        col = wc.collections.get("FAQ")
+        res = col.query.near_vector(
+            near_vector=vector,
+            limit=200,
+            return_properties=[
+                "faq_id","question","answer","category","subcategory","tags","source","created_at","updated_at"
+            ],
+            return_metadata=["distance"]
+        )
+        rows = []
+        for o in (res.objects or []):
+            p = o.properties or {}
+            d = getattr(o.metadata, "distance", None)
+            rows.append({
+                "distance": d,
+                "score": (1 - d) if isinstance(d, (int, float)) else None,
+                "faq_id": p.get("faq_id"),
+                "question": p.get("question"),
+                "answer": p.get("answer"),
+                "category": p.get("category"),
+                "subcategory": p.get("subcategory"),
+                "tags": p.get("tags"),
+                "source": p.get("source"),
+                "created_at": p.get("created_at"),
+                "updated_at": p.get("updated_at"),
+            })
+        return jsonify({"query": q, "rows": rows})
+    finally:
+        wc.close()
