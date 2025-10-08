@@ -71,8 +71,16 @@ def strip_query(q: str) -> str:
     return re.sub(r'[\r\n\t]+',' ', (q or "")).strip()
 
 def normalize_dashes(text: str) -> str:
-    # Replace em dash (—) and en dash (–) with ", "
-    return (text or "").replace("—", ", ").replace("–", ", ")
+    """Replace em/en/figure/minus dashes (and HTML entities) with ', ', then tidy spaces/commas."""
+    if not text:
+        return ""
+    # Replace any dash variant with ", "
+    s = re.sub(r'\s*(?:&mdash;|&ndash;|[—–‒−])\s*', ', ', text)
+    # Collapse repeated ", " from consecutive replacements
+    s = re.sub(r'(,\s*){2,}', ', ', s)
+    # Collapse multiple spaces
+    s = re.sub(r'\s{2,}', ' ', s).strip()
+    return s
 
 # --- Routes ---
 @app.route("/", methods=["GET","HEAD"])
@@ -221,7 +229,7 @@ def rag_faq():
                 temperature=0.3
             )
             answer = (resp.choices[0].message.content or "").strip()
-            # Normalize em/en dashes to ", " for clean display
+            # Normalize em/en dashes etc. to ", " for clean display
             answer = normalize_dashes(answer)
 
             # If model forgot citations, append a Sources line so users still see provenance
@@ -294,11 +302,9 @@ def feedback():
     logger.info(f"FEEDBACK {payload}")
     return jsonify({"ok": True})
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT","8002"))
-    logger.info(f"AddictionTube FAQ backend started on port {port}")
-    app.run(host="0.0.0.0", port=port)
-
+# -----------------------------------------
+# EXPORT: semantic sample (debug/dev)
+# -----------------------------------------
 @app.route("/export_sample", methods=["GET"])
 @limiter.limit("30/minute")
 def export_sample():
@@ -338,3 +344,157 @@ def export_sample():
         return jsonify({"query": q, "rows": rows})
     finally:
         wc.close()
+
+# -------------------------
+# EXPORT: simple JSON feed
+# -------------------------
+@app.route("/export_faqs", methods=["GET"])
+def export_faqs():
+    """
+    Lightweight export for crawlers/devs.
+    Params:
+      q           (optional) semantic query string
+      size        (int, default 200, max 500)
+      category    (optional)
+      subcategory (optional)
+      tag         (optional, can repeat ?tag=a&tag=b)
+    """
+    try:
+        q = strip_query(request.args.get("q", "") or "")
+        size = min(max(int(request.args.get("size", "200")), 1), 500)
+        category = (request.args.get("category") or "").strip()
+        subcategory = (request.args.get("subcategory") or "").strip()
+        tags = request.args.getlist("tag") or []
+
+        wc = get_weaviate_client()
+        try:
+            col = wc.collections.get("FAQ")
+
+            # Build optional filter
+            f = None
+            def andf(a,b): return a & b if a and b else (a or b)
+            if category:
+                f = andf(f, Filter.by_property("category").equal(category))
+            if subcategory:
+                f = andf(f, Filter.by_property("subcategory").equal(subcategory))
+            if tags:
+                f = andf(f, Filter.by_property("tags").contains_any(tags))
+
+            if q:
+                # semantic search export
+                vec = get_embedding(q)
+                res = col.query.near_vector(
+                    near_vector=vec,
+                    limit=size,
+                    filters=f,
+                    return_properties=["faq_id","question","answer","category","subcategory","tags","source","updated_at"]
+                )
+                objs = res.objects or []
+            else:
+                # simple recent slice (no vector)
+                res = col.query.fetch_objects(
+                    limit=size,
+                    filters=f,
+                    return_properties=["faq_id","question","answer","category","subcategory","tags","source","updated_at"],
+                    sort=[{"path": ["updated_at"], "order": "desc"}]
+                )
+                objs = res.objects or []
+
+            rows = []
+            for o in objs:
+                p = o.properties or {}
+                rows.append({
+                    "faq_id": p.get("faq_id"),
+                    "question": p.get("question"),
+                    "answer": p.get("answer"),
+                    "category": p.get("category"),
+                    "subcategory": p.get("subcategory"),
+                    "tags": p.get("tags"),
+                    "source": p.get("source"),
+                    "updated_at": p.get("updated_at")
+                })
+
+            return jsonify({
+                "query": q or None,
+                "count": len(rows),
+                "items": rows
+            })
+        finally:
+            wc.close()
+    except Exception as e:
+        logger.exception("export_faqs failed")
+        return jsonify({"error":"export_failed","details":str(e)}), 500
+
+# -------------------------
+# OPENAPI: minimal spec
+# -------------------------
+@app.route("/openapi.json", methods=["GET"])
+def openapi_spec():
+    spec = {
+        "openapi": "3.0.3",
+        "info": {
+            "title": "AddictionTube FAQ API",
+            "version": "1.0.0",
+            "description": "Simple endpoints for semantic FAQ search and RAG answers."
+        },
+        "servers": [{"url": "https://addictiontube-faq-backend.onrender.com"}],
+        "paths": {
+            "/search_faq": {
+                "post": {
+                    "summary": "Semantic FAQ search",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {"type": "string"},
+                                        "top_k": {"type": "integer", "default": 8},
+                                        "category": {"type": "string"},
+                                        "subcategory": {"type": "string"},
+                                        "tags": {"type": "array", "items": {"type": "string"}}
+                                    },
+                                    "required": ["query"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {"description": "OK"}
+                    }
+                }
+            },
+            "/rag_faq": {
+                "get": {
+                    "summary": "LLM answer grounded on FAQs",
+                    "parameters": [
+                        {"in":"query","name":"q","schema":{"type":"string"},"required":True},
+                        {"in":"query","name":"k","schema":{"type":"integer","default":8}},
+                        {"in":"query","name":"reroll","schema":{"type":"string","enum":["yes","no"]}}
+                    ],
+                    "responses": {"200":{"description":"OK"}}
+                }
+            },
+            "/export_faqs": {
+                "get": {
+                    "summary": "Simple JSON export for crawlers/devs",
+                    "parameters": [
+                        {"in":"query","name":"q","schema":{"type":"string"}},
+                        {"in":"query","name":"size","schema":{"type":"integer","default":200}},
+                        {"in":"query","name":"category","schema":{"type":"string"}},
+                        {"in":"query","name":"subcategory","schema":{"type":"string"}},
+                        {"in":"query","name":"tag","schema":{"type":"string"}, "description":"repeatable"}
+                    ],
+                    "responses": {"200":{"description":"OK"}}
+                }
+            }
+        }
+    }
+    return jsonify(spec)
+
+# ---- move this to the very bottom so all routes above are registered ----
+if __name__ == "__main__":
+    port = int(os.getenv("PORT","8002"))
+    logger.info(f"AddictionTube FAQ backend started on port {port}")
+    app.run(host="0.0.0.0", port=port)
